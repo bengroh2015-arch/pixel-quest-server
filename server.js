@@ -1,593 +1,283 @@
+// ============================================================
+// PIXEL QUEST - CO-OP MULTIPLAYER SERVER V3
+// ============================================================
+
 const http = require("http");
 const crypto = require("crypto");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 8080;
-
 const rooms = new Map();
 let playerNumber = 1;
 
-function createRoomCode() {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const httpServer = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Pixel Quest Multiplayer Server läuft! 🎮");
+});
 
-    let code;
-
-    do {
-        code = "";
-
-        for (let i = 0; i < 6; i++) {
-            code += chars[Math.floor(Math.random() * chars.length)];
-        }
-
-    } while (rooms.has(code));
-
-    return code;
-}
+const wss = new WebSocket.Server({ server: httpServer });
 
 function send(ws, data) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(data));
     }
 }
 
 function broadcast(room, data, except = null) {
     for (const player of room.players.values()) {
-        if (player.ws !== except) {
-            send(player.ws, data);
-        }
+        if (player.ws !== except) send(player.ws, data);
     }
 }
 
-function getRoomState(room) {
+function createRoomCode() {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code;
+    do {
+        code = "";
+        for (let i = 0; i < 6; i++) {
+            code += chars[Math.floor(Math.random() * chars.length)];
+        }
+    } while (rooms.has(code));
+    return code;
+}
+
+function publicPlayer(player) {
     return {
-        type: "roomState",
-        roomCode: room.code,
-        hostId: room.hostId,
-        started: room.started,
-        players: [...room.players.values()].map(player => ({
-            id: player.id,
-            name: player.name,
-            x: player.x,
-            y: player.y,
-            scaleX: player.scaleX,
-            state: player.state,
-            health: player.health,
-            maxHealth: player.maxHealth,
-            currentSword: player.currentSword
-        }))
+        id: player.id,
+        name: player.name,
+        x: player.x,
+        y: player.y,
+        scaleX: player.scaleX,
+        state: player.state,
+        health: player.health,
+        maxHealth: player.maxHealth,
+        currentSword: player.currentSword
     };
 }
 
+function sendRoomState(room) {
+    const players = [...room.players.values()].map(publicPlayer);
+    for (const player of room.players.values()) {
+        send(player.ws, {
+            type: "roomState",
+            roomCode: room.code,
+            hostId: room.hostId,
+            started: room.started,
+            players
+        });
+    }
+}
 
-// ============================================================
-// HTTP SERVER
-// ============================================================
+function removePlayerFromRoom(ws) {
+    if (!ws.roomCode) return;
 
-const server = http.createServer((req, res) => {
+    const room = rooms.get(ws.roomCode);
+    if (!room) {
+        ws.roomCode = null;
+        return;
+    }
 
-    res.writeHead(200, {
-        "Content-Type": "text/plain; charset=utf-8"
+    room.players.delete(ws.id);
+
+    broadcast(room, {
+        type: "playerLeft",
+        playerId: ws.id
     });
 
-    res.end("Pixel Quest Multiplayer Server läuft! 🎮");
-});
+    if (room.hostId === ws.id && room.players.size > 0) {
+        const newHost = room.players.values().next().value;
+        room.hostId = newHost.id;
+        broadcast(room, {
+            type: "hostChanged",
+            hostId: room.hostId
+        });
+    }
 
+    if (room.players.size === 0) {
+        rooms.delete(room.code);
+    } else {
+        sendRoomState(room);
+    }
 
-// ============================================================
-// WEBSOCKET SERVER
-// ============================================================
+    ws.roomCode = null;
+}
 
-const wss = new WebSocket.Server({
-    server: server
-});
-
-
-// ============================================================
-// VERBINDUNG
-// ============================================================
-
-wss.on("connection", (ws) => {
-
-    const playerId =
-        crypto.randomUUID();
-
-    const player = {
-        id: playerId,
-        ws: ws,
-
-        name: `Spieler ${playerNumber++}`,
-
-        roomCode: null,
-
+wss.on("connection", ws => {
+    ws.id = crypto.randomUUID();
+    ws.roomCode = null;
+    ws.player = {
+        id: ws.id,
+        ws,
+        name: "Spieler " + playerNumber++,
         x: 0,
         y: 500,
-
-        scaleX: 1,
-
+        scaleX: 0.5,
         state: "idle",
-
         health: 100,
         maxHealth: 100,
-
-        currentSword: "wood"
+        currentSword: "Holzschwert"
     };
 
-
-    console.log(
-        `Spieler verbunden: ${player.id}`
-    );
-
-
-    send(ws, {
-        type: "connected",
-        playerId: player.id
-    });
-
-
-    // ========================================================
-    // NACHRICHTEN
-    // ========================================================
+    send(ws, { type: "connected", playerId: ws.id });
 
     ws.on("message", raw => {
-
         let message;
-
         try {
-            message =
-                JSON.parse(raw.toString());
-        }
-
-        catch (error) {
-
-            send(ws, {
-                type: "error",
-                message: "Ungültige Nachricht."
-            });
-
+            message = JSON.parse(raw.toString());
+        } catch {
+            send(ws, { type: "error", message: "Ungültige Nachricht." });
             return;
         }
-
-
-        // ====================================================
-        // RAUM ERSTELLEN
-        // ====================================================
 
         if (message.type === "createRoom") {
-
-            if (player.roomCode) {
-                send(ws, {
-                    type: "error",
-                    message: "Du bist bereits in einem Raum."
-                });
-
-                return;
-            }
-
-
-            const roomCode =
-                createRoomCode();
-
-
+            removePlayerFromRoom(ws);
+            const code = createRoomCode();
             const room = {
-
-                code: roomCode,
-
-                hostId: player.id,
-
+                code,
+                hostId: ws.id,
                 started: false,
-
                 players: new Map()
             };
-
-
-            rooms.set(
-                roomCode,
-                room
-            );
-
-
-            player.roomCode =
-                roomCode;
-
-
-            room.players.set(
-                player.id,
-                player
-            );
-
-
-            send(ws, {
-                type: "roomCreated",
-                roomCode: roomCode,
-                playerId: player.id,
-                hostId: player.id
-            });
-
-
-            console.log(
-                `Raum erstellt: ${roomCode}`
-            );
-
-
+            rooms.set(code, room);
+            ws.roomCode = code;
+            if (typeof message.name === "string" && message.name.trim()) {
+                ws.player.name = message.name.trim().slice(0, 20);
+            }
+            room.players.set(ws.id, ws.player);
+            send(ws, { type: "roomCreated", roomCode: code, hostId: ws.id });
+            sendRoomState(room);
             return;
         }
 
-
-        // ====================================================
-        // RAUM BEITRETEN
-        // ====================================================
-
         if (message.type === "joinRoom") {
-
-            const roomCode =
-                String(message.roomCode || "")
-                    .trim()
-                    .toUpperCase();
-
-
-            const room =
-                rooms.get(roomCode);
-
+            const code = String(message.roomCode || "").trim().toUpperCase();
+            const room = rooms.get(code);
 
             if (!room) {
-
-                send(ws, {
-                    type: "error",
-                    message: "Raum nicht gefunden."
-                });
-
+                send(ws, { type: "error", message: "Dieser Raum existiert nicht." });
                 return;
             }
-
-
-            if (room.players.size >= 4) {
-
-                send(ws, {
-                    type: "error",
-                    message: "Der Raum ist voll."
-                });
-
-                return;
-            }
-
-
             if (room.started) {
-
-                send(ws, {
-                    type: "error",
-                    message: "Das Spiel in diesem Raum wurde bereits gestartet."
-                });
-
+                send(ws, { type: "error", message: "Das Spiel wurde bereits gestartet." });
+                return;
+            }
+            if (room.players.size >= 4) {
+                send(ws, { type: "error", message: "Der Raum ist voll. Maximal 4 Spieler." });
                 return;
             }
 
+            removePlayerFromRoom(ws);
+            ws.roomCode = code;
+            if (typeof message.name === "string" && message.name.trim()) {
+                ws.player.name = message.name.trim().slice(0, 20);
+            }
+            room.players.set(ws.id, ws.player);
 
-            player.roomCode =
-                roomCode;
-
-
-            room.players.set(
-                player.id,
-                player
-            );
-
+            broadcast(room, {
+                type: "playerJoined",
+                player: publicPlayer(ws.player)
+            }, ws);
 
             send(ws, {
                 type: "roomJoined",
-                roomCode: roomCode,
-                playerId: player.id,
+                roomCode: code,
                 hostId: room.hostId
             });
-
-
-            broadcast(
-                room,
-                {
-                    type: "playerJoined",
-                    player: {
-                        id: player.id,
-                        name: player.name,
-                        x: player.x,
-                        y: player.y,
-                        scaleX: player.scaleX,
-                        state: player.state,
-                        health: player.health,
-                        maxHealth: player.maxHealth,
-                        currentSword: player.currentSword
-                    }
-                },
-                ws
-            );
-
-
-            broadcast(
-                room,
-                getRoomState(room)
-            );
-
-
-            console.log(
-                `Spieler ${player.id} ist Raum ${roomCode} beigetreten`
-            );
-
-
+            sendRoomState(room);
             return;
         }
 
-
-        // ====================================================
-        // SPIEL STARTEN
-        // ====================================================
+        const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
+        if (!room) {
+            if (["startGame", "playerState", "worldState", "coopAttack", "collectCoin"].includes(message.type)) {
+                send(ws, { type: "error", message: "Du bist in keinem Raum." });
+            }
+            return;
+        }
 
         if (message.type === "startGame") {
-
-            if (!player.roomCode) {
-                return;
-            }
-
-
-            const room =
-                rooms.get(player.roomCode);
-
-
-            if (!room) {
-                return;
-            }
-
-
-            if (room.hostId !== player.id) {
-
-                send(ws, {
-                    type: "error",
-                    message: "Nur der Host kann das Spiel starten."
-                });
-
-                return;
-            }
-
-
+            if (room.hostId !== ws.id) return;
             room.started = true;
-
-
-            broadcast(
-                room,
-                {
-                    type: "gameStart"
-                }
-            );
-
-
-            console.log(
-                `Spiel gestartet: ${room.code}`
-            );
-
-
+            broadcast(room, { type: "gameStart" });
             return;
         }
-
-
-        // ====================================================
-        // SPIELER POSITION / STATUS
-        // ====================================================
 
         if (message.type === "playerState") {
+            const player = room.players.get(ws.id);
+            if (!player) return;
 
-            if (!player.roomCode) {
-                return;
-            }
+            // V3 akzeptiert die Werte direkt im Nachrichtenobjekt.
+            // Die alte verschachtelte Form wird ebenfalls unterstützt.
+            const data = message.player || message;
 
+            if (Number.isFinite(Number(data.x))) player.x = Number(data.x);
+            if (Number.isFinite(Number(data.y))) player.y = Number(data.y);
+            if (Number.isFinite(Number(data.scaleX))) player.scaleX = Number(data.scaleX);
+            if (typeof data.state === "string") player.state = data.state;
+            if (Number.isFinite(Number(data.health))) player.health = Number(data.health);
+            if (Number.isFinite(Number(data.maxHealth))) player.maxHealth = Number(data.maxHealth);
+            if (typeof data.currentSword === "string") player.currentSword = data.currentSword;
 
-            const room =
-                rooms.get(player.roomCode);
-
-
-            if (!room) {
-                return;
-            }
-
-
-            if (typeof message.x === "number") {
-                player.x = message.x;
-            }
-
-            if (typeof message.y === "number") {
-                player.y = message.y;
-            }
-
-            if (typeof message.scaleX === "number") {
-                player.scaleX = message.scaleX;
-            }
-
-            if (typeof message.state === "string") {
-                player.state = message.state;
-            }
-
-            if (typeof message.health === "number") {
-                player.health = message.health;
-            }
-
-            if (typeof message.maxHealth === "number") {
-                player.maxHealth = message.maxHealth;
-            }
-
-            if (typeof message.currentSword === "string") {
-                player.currentSword =
-                    message.currentSword;
-            }
-
-
-            broadcast(
-                room,
-                {
-                    type: "playerState",
-                    player: {
-                        id: player.id,
-                        x: player.x,
-                        y: player.y,
-                        scaleX: player.scaleX,
-                        state: player.state,
-                        health: player.health,
-                        maxHealth: player.maxHealth,
-                        currentSword: player.currentSword
-                    }
-                },
-                ws
-            );
-
-
+            broadcast(room, {
+                type: "playerState",
+                player: publicPlayer(player)
+            }, ws);
             return;
         }
 
+        // Host sendet die komplette gemeinsame Welt an die anderen Spieler.
+        if (message.type === "worldState") {
+            if (room.hostId !== ws.id || !room.started) return;
+            broadcast(room, message, ws);
+            return;
+        }
 
-        // ====================================================
-        // RAUM VERLASSEN
-        // ====================================================
+        // Ein Client möchte angreifen. Nur der Host verarbeitet den Angriff.
+        if (message.type === "coopAttack") {
+            if (!room.started) return;
+            const host = room.players.get(room.hostId);
+            if (host) send(host.ws, {
+                type: "coopAttack",
+                playerId: ws.id
+            });
+            return;
+        }
+
+        // Ein Client möchte eine gemeinsame Münze einsammeln.
+        if (message.type === "collectCoin") {
+            if (!room.started || typeof message.coinId !== "string") return;
+            const host = room.players.get(room.hostId);
+            if (host) send(host.ws, {
+                type: "collectCoinRequest",
+                playerId: ws.id,
+                coinId: message.coinId
+            });
+            return;
+        }
+
+        if (message.type === "coinCollected") {
+            if (room.hostId !== ws.id || !room.started) return;
+            if (typeof message.coinId !== "string") return;
+            broadcast(room, {
+                type: "coinCollected",
+                coinId: message.coinId,
+                playerId: message.playerId || ws.id
+            });
+            return;
+        }
 
         if (message.type === "leaveRoom") {
-
-            leaveRoom(player);
-
-            return;
+            removePlayerFromRoom(ws);
+            send(ws, { type: "leftRoom" });
         }
-
     });
 
-
-    // ========================================================
-    // VERBINDUNG GETRENNT
-    // ========================================================
-
-    ws.on("close", () => {
-
-        console.log(
-            `Spieler getrennt: ${player.id}`
-        );
-
-        leaveRoom(player);
-    });
-
+    ws.on("close", () => removePlayerFromRoom(ws));
 });
 
-
-// ============================================================
-// RAUM VERLASSEN
-// ============================================================
-
-function leaveRoom(player) {
-
-    if (!player.roomCode) {
-        return;
-    }
-
-
-    const room =
-        rooms.get(player.roomCode);
-
-
-    if (!room) {
-
-        player.roomCode = null;
-
-        return;
-    }
-
-
-    room.players.delete(
-        player.id
-    );
-
-
-    broadcast(
-        room,
-        {
-            type: "playerLeft",
-            playerId: player.id
-        }
-    );
-
-
-    // Host wechseln
-    if (room.hostId === player.id) {
-
-        const nextPlayer =
-            room.players.values().next().value;
-
-
-        if (nextPlayer) {
-
-            room.hostId =
-                nextPlayer.id;
-
-
-            broadcast(
-                room,
-                {
-                    type: "hostChanged",
-                    hostId: room.hostId
-                }
-            );
-
-        }
-    }
-
-
-    player.roomCode = null;
-
-
-    if (room.players.size === 0) {
-
-        rooms.delete(
-            room.code
-        );
-
-        console.log(
-            `Raum gelöscht: ${room.code}`
-        );
-
-    }
-
-    else {
-
-        broadcast(
-            room,
-            getRoomState(room)
-        );
-    }
-
-
-    send(player.ws, {
-        type: "leftRoom"
-    });
-}
-
-
-// ============================================================
-// SERVER START
-// ============================================================
-
-server.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
-
-        console.log(
-            "======================================"
-        );
-
-        console.log(
-            "Pixel Quest Multiplayer Server läuft!"
-        );
-
-        console.log(
-            `Port: ${PORT}`
-        );
-
-        console.log(
-            "WebSocket Server bereit."
-        );
-
-        console.log(
-            "======================================"
-        );
-    }
-);
+httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log("====================================");
+    console.log(" PIXEL QUEST CO-OP SERVER V3");
+    console.log(" Server läuft auf Port " + PORT);
+    console.log("====================================");
+});
